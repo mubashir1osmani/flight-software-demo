@@ -1,89 +1,42 @@
-// Build: typst compile docs/design_document.typ
-#set document(title: "CanSat Communications Library: Design Document")
-#set page(paper: "us-letter", margin: (x: 0.75in, y: 0.6in))
-#set text(font: ("Helvetica Neue", "Helvetica", "Arial"), size: 9.3pt)
-#set par(justify: true, leading: 0.5em, spacing: 0.75em)
-#set list(indent: 0.4em, body-indent: 0.45em, spacing: 0.5em)
-#show raw: set text(font: ("Menlo", "Courier New"), size: 8.6pt)
-#show heading.where(level: 1): it => block(above: 1.0em, below: 0.55em,
-  text(size: 11pt, weight: "bold", it.body))
+#set page(paper: "us-letter", margin: 1in)
+#set text(size: 11pt)
+#set par(justify: false)
 
 #align(center)[
-  #text(size: 15pt, weight: "bold")[CanSat Communications Library: Design Document] \
-  #v(0.15em)
-  #text(fill: gray.darken(20%))[XBee 0x10 / 0x90 framing and payload serialization for Flight Software]
+  #text(size: 14pt)[*CanSat Comms Library Design*] \
+  Mubashir Osmani
 ]
 
-= 1. Microcontroller suitability and avoiding dynamic allocation
+== 1. Running on the microcontroller
 
-The library targets a small Arm Cortex-M. It never uses the heap: no `new`, `delete`, `malloc`, STL containers, exceptions or RTTI. It builds cleanly with `-fno-exceptions -fno-rtti -Wconversion`.
+The flight computer is a small Cortex-M, so the main thing I wanted to avoid was dynamic memory. Nothing in the library calls `new` or `malloc` or uses `std::vector`, and it compiles with exceptions and RTTI turned off. Instead, every function takes a buffer from the caller along with its size, and returns a status code saying whether it worked. The biggest frame we can build is 118 bytes (with the payload capped at 100 bytes) and the biggest message is 7 bytes. Both are constants in the headers, so the buffers can just be static arrays and we know exactly how much RAM the radio code uses before we fly. That means there's no chance of the heap fragmenting or an allocation failing halfway through the mission.
 
-- *Caller-owned, fixed-size buffers.* Every function writes into a buffer the caller passes in, along with its capacity. Compile-time constants (`kMaxTransmitFrameSize` = 118 B, `kMaxMessageSize` = 7 B) let those buffers be allocated statically. Worst-case RAM is known at link time, and nothing can fragment or run out of memory mid-flight.
-- *Zero-copy receive.* `parse_receive_packet()` returns a pointer and length into the caller's receive buffer instead of copying the RF data. On transmit, the only copy is placing the payload into the frame, which can't be avoided.
-- *Deterministic cost.* Every operation is a single bounded O(n) pass with no recursion or allocation. It is safe to call from a periodic task, and short enough to call from a UART RX handler.
-- *No platform dependencies.* The library uses only `<cstdint>` and `<cstddef>`, with no I/O, OS or UART code. The same code runs on the desktop for unit tests and on the target.
+I also tried not to copy data around more than necessary. When a 0x90 frame is parsed, the result just points at the payload inside the receive buffer instead of copying it out. Everything is a single loop over the input, so it takes about the same time every time. The library doesn't touch the UART at all, which is also what let me test all of it on my laptop with GoogleTest.
 
-*Tradeoffs.*
-- The maximum payload is fixed at compile time (default 100 B, matching XBee `NP`), so buffers always reserve the worst case even when a frame is only 25 B.
-- A receive view is valid only while the caller's buffer is unchanged, so the payload must be decoded before the buffer is reused.
-- Pointer-and-length APIs are less convenient than `std::vector`, and every status code has to be checked.
+The downside is that the payload limit is fixed at compile time, so the buffers are always sized for the worst case even though our messages are tiny. The parsed payload is only valid until the receive buffer gets reused, so commands have to be decoded right away. It's also a bit clunkier to use than containers since you have to pass sizes around and check every return value. For flight code I think that's worth it.
 
-These costs are worth it for bounded memory and no hidden failure paths.
+== 2. Payload format
 
-= 2. Payload format
+Each payload starts with one byte saying what kind of message it is, followed by the struct fields in order:
 
-Byte 0 of every payload is a *message type ID*. The fields follow in declaration order, with no padding:
-
-#{
-show raw: set text(size: 7.6pt)
-table(
-  columns: (auto, auto, auto, 1fr),
-  inset: (x: 5pt, y: 3pt),
-  stroke: 0.4pt + gray,
-  fill: (_, y) => if y == 0 { luma(230) },
-  table.header([*ID*], [*Message*], [*Bytes*], [*Layout*]),
-  [`0x01`], [CommandMechanism], [3], [`[01][mechanism_id u8][value u8]`],
-  [`0x02`], [CommandTelemetry], [2], [`[02][is_on u8 : 0x00 or 0x01 only]`],
-  [`0x03`], [OutTelemetry], [7], [`[03][seconds_since_epoch u32 BE][mechanisms_deployed_flags u16 BE]`],
+#table(
+  columns: 3,
+  [*ID*], [*Message*], [*Bytes*],
+  [0x01], [CommandMechanism], [ID, mechanism_id, value (3 total)],
+  [0x02], [CommandTelemetry], [ID, is_on (2 total)],
+  [0x03], [OutTelemetry], [ID, seconds (4 bytes), deployed flags (2 bytes) (7 total)],
 )
-}
 
-- *Field sizes match the struct types exactly.* The uint32 seconds and uint16 flags are not narrowed, so no range is lost. A full telemetry payload is just 7 bytes. A `bool` takes one byte, which is simpler and clearer than bit-packing.
-- *Big-endian (network order).* XBee already encodes its own length and address fields this way, so one convention covers the whole frame. Fields are written with explicit shifts rather than by `memcpy`-ing structs. The format therefore doesn't depend on compiler padding, `sizeof(bool)` or CPU endianness, and a little-endian Cortex-M and a ground-station PC produce identical bytes.
-- *A 1-byte type ID first.* The receiver can tell messages apart before reading any fields, and each type gets its own exact length check. There is room for 252 more types. ID 0x00 is reserved, so an all-zero payload is rejected. `OutTelemetry` has its own ID even though the CanSat only sends it, so the ground station can decode it with the same code.
-- *No checksum or version field in the payload.* The XBee frame checksum and the radio's MAC-level CRC already cover the data. A versioned message can be added later under a new type ID without breaking existing ones.
+I kept every field the same size as in the struct so nothing gets cut off. The `bool` is sent as a full byte and has to be 0 or 1. Anything bigger than a byte is big-endian, mostly because XBee already uses big-endian for its own length and address fields, so the whole frame reads the same way. I write each byte with shifts instead of `memcpy`-ing the struct. That way compiler padding and the CPU's byte order don't change what goes over the radio, and the CanSat and the ground station laptop produce the same bytes.
 
-= 3. Handling malformed, incomplete or invalid input
+The ID byte is what lets the receiver tell a mechanism command apart from a telemetry command. Each ID also has one fixed length, which makes it easy to check that a message isn't cut short or padded with junk. I didn't use 0x00 as an ID so a payload of all zeros doesn't decode as something real. I didn't put a checksum in the payload because the XBee frame already has one.
 
-Validation is *layered*. Each layer rejects what it can see and returns a specific `enum class` status. Every check reads only bytes already proven to exist, and output is written only on success. A caller can never act on a half-decoded message.
+== 3. Bad or incomplete data
 
-*Frame layer*, checked in this order:
-+ Start delimiter: `BadStartDelimiter`.
-+ Length field outside the range of any valid API frame: `BadLength`. A corrupt length can't cause an over-read or a long wait.
-+ Fewer bytes than the declared frame: `Incomplete`.
-+ Checksum mismatch: `BadChecksum`.
-+ Frame type other than 0x90: `UnexpectedFrameType`, and `frame_len` is still reported.
-+ A 0x90 frame too short for its header, or carrying more than the maximum payload: `BadLength`.
+The radio link is going to be noisy, so I assumed anything could show up on the UART. The parser checks the start byte first, then the length field, then waits until the whole frame has arrived, then checks the checksum, and only then looks at what type of frame it is. It never reads a byte before it knows that byte is actually there. Checking the length early matters because a corrupted length could otherwise make it wait for hundreds of bytes that are never coming.
 
-Checking the type after the checksum means that valid frames the radio sends on its own, such as 0x8B Transmit Status and 0x8A Modem Status, are recognised and skipped as whole frames. They are not mistaken for corruption.
+I check the frame type after the checksum because the XBee sends its own frames too, like 0x8B transmit status. Those aren't errors, so the parser reports them as a different frame type and tells the caller how long they are so they can be skipped. After that, the payload decoder rejects empty payloads, unknown IDs, wrong lengths and an `is_on` byte that isn't 0 or 1. Nothing gets written to the output unless the whole message is valid.
 
-*Payload layer:*
-- Empty payload: `Empty`.
-- Unknown ID: `UnknownType`.
-- Too short, or with trailing bytes: `WrongLength`.
-- A bool byte other than 0 or 1: `InvalidValue`.
+For testing I cut a valid frame off at every possible length, flipped every bit one at a time, and fed in a few thousand random buffers. None of those crashed or got accepted as valid.
 
-Tests cover all of the following. None of them crash or are accepted:
-- every truncation of a valid frame
-- every single-bit flip in every byte
-- wrong lengths and frame types
-- null pointers
-- thousands of pseudo-random buffers
-
-*What Flight Software should do:*
-- *`Incomplete`* is not an error. Keep the bytes and wait for more UART data. Use a timeout so a frame that stops arriving partway is eventually discarded.
-- *`BadStartDelimiter`, `BadLength`, `BadChecksum`:* drop one byte and scan forward for the next 0x7E. A 0x7E that happens to appear inside data is rejected by the length and checksum checks.
-- *`UnexpectedFrameType`:* consume `frame_len` bytes. Optionally pass 0x8B frames to delivery tracking.
-- *A valid 0x90 frame whose payload fails to decode:* consume `frame_len` bytes and ignore the message.
-- *Never actuate on a doubtful command.* Deploying a mechanism by mistake is worse than missing a command, because the ground station can resend it. Keep a counter for each error status and report the counters in telemetry, so the ground team can tell link noise from a software bug.
-- Malformed input must never reset or stall the flight loop. Telemetry keeps going no matter what arrives on the receive path.
+On the flight software side, if a frame is incomplete it should just keep the bytes and wait for more, with a timeout so it doesn't wait forever. If the start byte, length or checksum is bad, it should drop a byte and look for the next 0x7E. If the frame is fine but it's not one we care about, or the payload doesn't decode, skip it. The most important rule is to never act on a command we're not sure about. Accidentally deploying a mechanism is a lot worse than missing a command, since the ground station can always resend it. It would also be useful to count each type of error and send the counts down in telemetry, so we can tell whether problems are coming from the radio link or from a bug.
